@@ -149,7 +149,7 @@ function inputCheck(winSize)
             return
         end
 
-        local mp = ui.mouseLocalPos()
+        local mp = ui.mousePos()  -- Use absolute screen coordinates since window is 1x1
         local mw = ui.mouseWheel()
 
         local pos, dir
@@ -230,68 +230,22 @@ end
 -- Window initialization
 local geometryShotsRebuilt = false
 local lastWindowSize = vec2(800, 600)
-local windowSizeCheckInterval = 0
-local targetWindowSize = vec2(sim.windowWidth, sim.windowHeight)
-
-function script.onShowWindow()
-    -- Try different window name patterns
-    local patterns = {
-        'IMGUI_LUA_FastTravel_fasttravel_main',
-        'IMGUI_LUA_fasttravel_app_fasttravel_main',
-        'fasttravel_main'
-    }
-
-    targetWindowSize = vec2(sim.windowWidth, sim.windowHeight)
-
-    for _, pattern in ipairs(patterns) do
-        local appWindow = ac.accessAppWindow(pattern)
-        if appWindow then
-            appWindow:move(vec2(0, 0))
-            appWindow:setSize(targetWindowSize)
-            ac.log('FastTravel: Found window "' .. pattern .. '", moved to 0,0 and sized to ' .. targetWindowSize.x .. 'x' .. targetWindowSize.y)
-            return
-        end
-    end
-    ac.log('FastTravel: Could not find window to reposition')
-end
+local screenSize = vec2(sim.windowWidth, sim.windowHeight)
 
 -- Main window function
 function script.windowMain(dt)
-    local winSize = ui.windowSize()
+    -- Update screen size
+    screenSize = vec2(sim.windowWidth, sim.windowHeight)
 
-    -- Check if game window size changed
-    local currentScreenSize = vec2(sim.windowWidth, sim.windowHeight)
-    if math.abs(targetWindowSize.x - currentScreenSize.x) > 10 or math.abs(targetWindowSize.y - currentScreenSize.y) > 10 then
-        targetWindowSize = currentScreenSize
-        windowSizeCheckInterval = 0  -- Force immediate check
-    end
+    -- Keep window at 1x1 since we're not drawing anything (manifest handles this)
 
-    -- Periodically try to resize window to match screen if it's not the right size
-    windowSizeCheckInterval = windowSizeCheckInterval + dt
-    if windowSizeCheckInterval > 1 then  -- Check every second
-        windowSizeCheckInterval = 0
-        if math.abs(winSize.x - targetWindowSize.x) > 10 or math.abs(winSize.y - targetWindowSize.y) > 10 then
-            local patterns = {
-                'IMGUI_LUA_FastTravel_fasttravel_main',
-                'IMGUI_LUA_fasttravel_app_fasttravel_main',
-                'fasttravel_main'
-            }
-            for _, pattern in ipairs(patterns) do
-                local appWindow = ac.accessAppWindow(pattern)
-                if appWindow then
-                    appWindow:move(vec2(0, 0))
-                    appWindow:setSize(targetWindowSize)
-                    ac.log('FastTravel: Resized window to ' .. targetWindowSize.x .. 'x' .. targetWindowSize.y)
-                    break
-                end
-            end
-        end
-    end
+    -- Always use screenSize for geometry shots, not the actual window size
+    local winSize = screenSize
 
-    -- Rebuild geometry shots if window size changed significantly
-    if not geometryShotsRebuilt or math.abs(winSize.x - lastWindowSize.x) > 50 or math.abs(winSize.y - lastWindowSize.y) > 50 then
-        windowSize = vec2(winSize.x, winSize.y)
-        lastWindowSize = winSize:clone()
+    -- Rebuild geometry shots if screen size changed significantly
+    if not geometryShotsRebuilt or math.abs(screenSize.x - lastWindowSize.x) > 50 or math.abs(screenSize.y - lastWindowSize.y) > 50 then
+        windowSize = vec2(screenSize.x, screenSize.y)
+        lastWindowSize = screenSize:clone()
 
         mapShot = ac.GeometryShot(ac.findNodes('trackRoot:yes'), windowSize, 1, false)
         mapShot:setClippingPlanes(10, 30000)
@@ -385,38 +339,7 @@ function script.windowMain(dt)
             roadsShot:update(mapCamera.transform.position, mapCamera.transform.look, mapCamera.transform.up, mapFOV)
         end
 
-        -- Draw map
-        local mp = ui.mouseLocalPos()
-        mapShot:setShadersType(render.ShadersType.Simplest)
-        mapFullShot:setShadersType(render.ShadersType.Simplest)
-        ui.drawRectFilled(vec2(), winSize, rgbm(0, 0, 0, 0.5))
-
-        if mapZoom == 1 then
-            ui.drawImage(mapFullShot, vec2(), winSize)
-        else
-            ui.drawImage(mapShot, vec2(), winSize)
-        end
-        ui.drawImage(roadsShot, vec2(), winSize, rgbm(0, 0.9, 1, 1))
-
-        -- Draw cursor
-        local cursorSize = 15
-        if teleportAvailable then
-            ui.drawCircle(mp, cursorSize, rgbm(0, 1, 0, 1), 16, 2)
-        else
-            ui.drawCircle(mp, cursorSize, rgbm(1, 0, 0, 1), 16, 2)
-        end
-
-        -- Draw help text
-        ui.dwriteDrawText('Left Click: Teleport | Mouse Wheel: Zoom | M: Close', 18, vec2(10, winSize.y - 30), rgbm(1, 1, 1, 1))
-    else
-        -- Show hint when not in map mode and stationary
-        local carState = ac.getCar(0)
-        if carState.speedKmh < 2 then
-            local opacity = math.sin(sim.gameTime * 5) / 2 + 0.5
-            ui.pushDWriteFont(fontBold)
-            ui.dwriteDrawText('Press M key to FastTravel', 20, vec2(winSize.x * 0.1, winSize.y * 0.9), rgbm(1, 1, 1, opacity))
-            ui.popDWriteFont()
-        end
+        -- Drawing removed - window stays at 1x1
     end
 
     ui.popClipRect()
