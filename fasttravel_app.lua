@@ -230,6 +230,8 @@ end
 -- Window initialization
 local geometryShotsRebuilt = false
 local lastWindowSize = vec2(800, 600)
+local windowSizeCheckInterval = 0
+local targetWindowSize = vec2(sim.windowWidth, sim.windowHeight)
 
 function script.onShowWindow()
     -- Try different window name patterns
@@ -239,13 +241,14 @@ function script.onShowWindow()
         'fasttravel_main'
     }
 
+    targetWindowSize = vec2(sim.windowWidth, sim.windowHeight)
+
     for _, pattern in ipairs(patterns) do
         local appWindow = ac.accessAppWindow(pattern)
         if appWindow then
-            local screenSize = vec2(sim.windowWidth, sim.windowHeight)
             appWindow:move(vec2(0, 0))
-            appWindow:setSize(screenSize)
-            ac.log('FastTravel: Found window "' .. pattern .. '", moved to 0,0 and sized to ' .. screenSize.x .. 'x' .. screenSize.y)
+            appWindow:setSize(targetWindowSize)
+            ac.log('FastTravel: Found window "' .. pattern .. '", moved to 0,0 and sized to ' .. targetWindowSize.x .. 'x' .. targetWindowSize.y)
             return
         end
     end
@@ -255,6 +258,35 @@ end
 -- Main window function
 function script.windowMain(dt)
     local winSize = ui.windowSize()
+
+    -- Check if game window size changed
+    local currentScreenSize = vec2(sim.windowWidth, sim.windowHeight)
+    if math.abs(targetWindowSize.x - currentScreenSize.x) > 10 or math.abs(targetWindowSize.y - currentScreenSize.y) > 10 then
+        targetWindowSize = currentScreenSize
+        windowSizeCheckInterval = 0  -- Force immediate check
+    end
+
+    -- Periodically try to resize window to match screen if it's not the right size
+    windowSizeCheckInterval = windowSizeCheckInterval + dt
+    if windowSizeCheckInterval > 1 then  -- Check every second
+        windowSizeCheckInterval = 0
+        if math.abs(winSize.x - targetWindowSize.x) > 10 or math.abs(winSize.y - targetWindowSize.y) > 10 then
+            local patterns = {
+                'IMGUI_LUA_FastTravel_fasttravel_main',
+                'IMGUI_LUA_fasttravel_app_fasttravel_main',
+                'fasttravel_main'
+            }
+            for _, pattern in ipairs(patterns) do
+                local appWindow = ac.accessAppWindow(pattern)
+                if appWindow then
+                    appWindow:move(vec2(0, 0))
+                    appWindow:setSize(targetWindowSize)
+                    ac.log('FastTravel: Resized window to ' .. targetWindowSize.x .. 'x' .. targetWindowSize.y)
+                    break
+                end
+            end
+        end
+    end
 
     -- Rebuild geometry shots if window size changed significantly
     if not geometryShotsRebuilt or math.abs(winSize.x - lastWindowSize.x) > 50 or math.abs(winSize.y - lastWindowSize.y) > 50 then
