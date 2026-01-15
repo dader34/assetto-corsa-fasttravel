@@ -2,52 +2,48 @@
 -- Modified from original AssettoServer FastTravel plugin by Tsuka1427
 -- Adapted for offline single-player use as CSP app
 
--- Simple config storage (ac.storage can't store tables/vec3)
+-- Constants
+local CLIP_NEAR = 10
+local CLIP_FAR = 30000
+local RAYCAST_MAX_DIST = 10000
+local CAMERA_LAG = 0.8
+local CAMERA_FADE_THRESHOLD = 0.001
+local TARGET_SMOOTHING_TIME = 0.3
+local GENTLE_STOP_DELAY = 1
+local COLLISION_REENABLE_DELAY = 5
+local SCREEN_RESIZE_THRESHOLD = 50
+local MOUSE_MOVE_THRESHOLD = 10
+local INVALID_HEIGHT = -9999
+local HEIGHT_IGNORE_FRAMES = 3
+
+local ZOOM_HEIGHTS = { 100, 1000, 4000, 15000 }
+local PAN_SPEEDS = { 1, 5, 20, 0 }
+local EDGE_THRESHOLD = 0.4
+
+-- Config (persisted)
 local config = ac.storage({
     disableCollisions = true,
-    showMapImg = true,
 })
 
-local mapFixedTargetPosition = vec3(0, 0, 0)
-local mapZoomValue = { 100, 1000, 4000, 15000 }
-local mapMoveSpeed = { 1, 5, 20, 0 }
-
+-- CSP API availability
 local supportAPI_physics = physics.setGentleStop ~= nil
 local supportAPI_collision = physics.disableCarCollisions ~= nil
 local supportAPI_matrix = ac.getPatchVersionCode() >= 3037
-local trackCompassOffset = 0
-
-local font = 'Segoe UI'
-local fontBold = 'Segoe UI;Weight=Bold'
 
 local sim = ac.getSim()
-local trackMapImage = ac.getFolder(ac.FolderID.ContentTracks) .. '/' .. ac.getTrackFullID('/') .. '/map.png'
-ui.decodeImage(trackMapImage)
-local trackMapImageSize = vec2(981, 1440)
-if ui.isImageReady(trackMapImage) then
-    trackMapImageSize = ui.imageSize(trackMapImage)
-end
 
--- Initialize geometry shots with screen size
-local windowSize = vec2(sim.windowWidth, sim.windowHeight)
-local mapShot = ac.GeometryShot(ac.findNodes('trackRoot:yes'), windowSize, 1, false)
-mapShot:setClippingPlanes(10, 30000)
-
-local mapFullShot = ac.GeometryShot(ac.findNodes('sceneRoot:yes'), windowSize, 1, false)
+-- Track bounds for camera limits
+local trackBounds = { xMin = 0, xMax = 0, zMin = 0, zMax = 0 }
+local mapCenterPos = vec3(0, 0, 0)
 
 local roadsNode = ac.findNodes('trackRoot:yes'):findMeshes('{ ?ROAD?, ?Road?, ?road?, ?ASPH?, ?Asph?, ?asph?, ?jnc_asp? }')
-local roadsShot = ac.GeometryShot(roadsNode, windowSize, 1, false)
-roadsShot:setShadersType(render.ShadersType.Simplified)
-roadsShot:setAmbientColor(rgbm(100, 100, 100, 1))
-roadsShot:setClippingPlanes(10, 30000)
-ac.setExtraTrackLODMultiplier(10)
-
-local roadsAABB_min, roadsAABB_max, meshCount = roadsNode:getStaticAABB()
-local limitArea = vec4(roadsAABB_min.x, roadsAABB_min.z, roadsAABB_max.x, roadsAABB_max.z)
-
--- Auto-center map
-if mapFixedTargetPosition.x == 0 and mapFixedTargetPosition.z == 0 then
-    mapFixedTargetPosition = vec3((roadsAABB_min.x + roadsAABB_max.x) / 2, 0, (roadsAABB_min.z + roadsAABB_max.z) / 2)
+local roadsAABB_min, roadsAABB_max = roadsNode:getStaticAABB()
+if roadsAABB_min and roadsAABB_max then
+    trackBounds.xMin = roadsAABB_min.x
+    trackBounds.xMax = roadsAABB_max.x
+    trackBounds.zMin = roadsAABB_min.z
+    trackBounds.zMax = roadsAABB_max.z
+    mapCenterPos = vec3((roadsAABB_min.x + roadsAABB_max.x) / 2, 0, (roadsAABB_min.z + roadsAABB_max.z) / 2)
 end
 
 -- State variables
@@ -59,226 +55,297 @@ local mapFOV = 90
 local mapMovePower = vec2()
 local mapTargetPos = vec3()
 local mapTargetEstimate = 0
-local mouseThreshold = vec2(0.4, 0.4)
-local lastPos = vec3()
-local lastMp = vec2()
+local carStartPos = vec3()
+local lastMousePos = vec2()
 local lastCameraMode = 0
 local disabledCollision = false
 local teleportEstimate = 0
-local teleportAvailable = false
-local map_opacity = 0
 
--- Helper functions
-local function posToViewSpace(mat, pos)
-    local o = mat:transform(vec4(pos.x, pos.y, pos.z, 1))
-    return vec2(o.x, -o.y) / o.w / 2 + 0.5
-end
+-- Height tracking for raycast smoothing
+local heightIgnoreCount = 0
+local lastValidHeight = INVALID_HEIGHT
 
+-- Helper: Convert screen position to world direction
 local function screenToWorldDir(screenPos, view, proj)
     local p1 = proj:inverse():transformPoint(vec3(2 * screenPos.x - 1, 1 - 2 * screenPos.y, 0.5))
     return view:inverse():transformVector(p1):normalize()
 end
 
-local issueIgnoreFrames = 3
-local issueHeightFrame = 0
-local lastRealHeight = -9999
+-- Helper: Raycast to track with frame smoothing to handle gaps
 local function getTrackDistance(pos, dir)
-    local d = physics.raycastTrack(pos, dir, 10000)
-    if 10000 < d or d < 0.0 then d = -1 end
-    if d ~= -1 then
-        issueHeightFrame = 0
-        lastRealHeight = d
-        return lastRealHeight
-    else
-        issueHeightFrame = issueHeightFrame + 1
-        if issueHeightFrame < issueIgnoreFrames then
-            return lastRealHeight
-        end
+    local dist = physics.raycastTrack(pos, dir, RAYCAST_MAX_DIST)
+
+    if dist >= 0 and dist < RAYCAST_MAX_DIST then
+        heightIgnoreCount = 0
+        lastValidHeight = dist
+        return dist
     end
-    lastRealHeight = -9999
+
+    -- Use last valid height for a few frames to smooth over gaps
+    heightIgnoreCount = heightIgnoreCount + 1
+    if heightIgnoreCount < HEIGHT_IGNORE_FRAMES then
+        return lastValidHeight
+    end
+
+    lastValidHeight = INVALID_HEIGHT
     return nil
 end
 
-local function projectPoint(position, winSize)
-    local screenPos = vec2()
-    if supportAPI_matrix and mapCamera then
-        local t = mapCamera.transform
-        local view = mat4x4.look(t.position, t.look, t.up)
-        local proj = mat4x4.perspective(math.rad(mapCamera.fov), winSize.x / winSize.y, 10, 30000)
-        screenPos = posToViewSpace(view:mul(proj), position)
-    else
-        if ac.getPatchVersionCode() >= 2735 then
-            screenPos = render.projectPoint(position, render.ProjectFace.Center)
-        else
-            screenPos = render.projectPoint(position)
-        end
-    end
-    return screenPos
-end
-
-function teleportExec(pos, rot)
+-- Helper: Teleport car to position
+local function teleport(pos)
     if supportAPI_physics then physics.setGentleStop(0, false) end
-    physics.setCarPosition(0, pos, rot)
+    physics.setCarPosition(0, pos, nil)
     ac.log(string.format('Teleported to: %.1f, %.1f, %.1f', pos.x, pos.y, pos.z))
     mapMode = false
 end
 
-function inputCheck(winSize)
-    local carState = ac.getCar(0)
-    if ui.keyboardButtonPressed(ui.KeyIndex.M, false) and not ui.anyItemFocused() and not ui.anyItemActive() and not sim.isPaused then
-        mapMode = not mapMode
-        if mapMode then
-            if not mapCamera then
-                mapCamera = ac.grabCamera('map camera')
-            end
-            mapZoom = 1
-            lastPos = carState.position:clone()
-            lastMp = ui.mousePos()
-            mapCamera.transform.position = lastPos
-            mapCamera.fov = mapFOV
-            lastCameraMode = sim.cameraMode
-            ac.log('FastTravel map opened')
-        else
-            ac.log('FastTravel map closed')
-        end
+-- Helper: Get mouse ray origin and direction
+local function getMouseRay(screenSize)
+    local mousePos = ui.mousePos()
+
+    if supportAPI_matrix then
+        local camPos = mapCamera.transform.position
+        local view = mat4x4.look(camPos, mapCamera.transform.look, mapCamera.transform.up)
+        local proj = mat4x4.perspective(math.rad(mapCamera.fov), screenSize.x / screenSize.y, CLIP_NEAR, CLIP_FAR)
+        local dir = screenToWorldDir(mousePos / screenSize, view, proj)
+        return camPos, dir, mousePos
+    else
+        local ray = render.createPointRay(mousePos)
+        return ray.pos, ray.dir, mousePos
+    end
+end
+
+-- Helper: Get world position under mouse cursor
+local function getMouseWorldPos(screenSize)
+    local rayPos, rayDir = getMouseRay(screenSize)
+    local distance = getTrackDistance(rayPos, rayDir)
+    if distance then
+        return rayPos + rayDir * distance
+    end
+    return nil
+end
+
+-- Handle map toggle with M key
+local function handleMapToggle()
+    local canToggle = not ui.anyItemFocused() and not ui.anyItemActive() and not sim.isPaused
+    if not ui.keyboardButtonPressed(ui.KeyIndex.M, false) or not canToggle then
+        return
     end
 
-    if mapMode and mapCamera then
-        if sim.isPaused then
-            mapMode = false
-            return
+    mapMode = not mapMode
+    if mapMode then
+        if not mapCamera then
+            mapCamera = ac.grabCamera('map camera')
         end
+        mapZoom = 1
+        carStartPos = ac.getCar(0).position:clone()
+        lastMousePos = ui.mousePos()
+        mapCamera.transform.position = carStartPos
+        mapCamera.fov = mapFOV
+        lastCameraMode = sim.cameraMode
+        ac.log('FastTravel map opened')
+    else
+        ac.log('FastTravel map closed')
+    end
+end
 
-        local mp = ui.mousePos()  -- Use absolute screen coordinates since window is 1x1
-        local mw = ui.mouseWheel()
+-- Handle mouse wheel zoom
+local function handleZoom(screenSize)
+    local wheel = ui.mouseWheel()
+    if wheel == 0 then return end
 
-        local pos, dir
-        if supportAPI_matrix then
-            local view = mat4x4.look(mapCamera.transform.position, mapCamera.transform.look, mapCamera.transform.up)
-            local proj = mat4x4.perspective(math.rad(mapCamera.fov), winSize.x / winSize.y, 10, 30000)
-            pos = mapCamera.transform.position
-            dir = screenToWorldDir(mp / winSize, view, proj)
+    local prevZoom = mapZoom
+    if wheel < 0 and mapZoom < #ZOOM_HEIGHTS then
+        mapZoom = mapZoom + 1
+    elseif wheel > 0 and mapZoom > 1 then
+        mapZoom = mapZoom - 1
+    end
+
+    if mapZoom ~= prevZoom then
+        mapTargetEstimate = 0
+        if mapZoom == #ZOOM_HEIGHTS then
+            mapTargetPos = mapCenterPos
         else
-            local ray = render.createPointRay(mp)
-            pos = ray.pos
-            dir = ray.dir
-        end
-
-        local mpr = nil
-        local distance = getTrackDistance(pos, dir)
-        if distance then
-            mpr = pos + dir * distance
-        end
-
-        -- Zoom handling
-        local zoomed = false
-        local lastMapZoom = mapZoom
-        if mw < 0 and mapZoom < #mapZoomValue then
-            mapZoom = mapZoom + 1
-            zoomed = true
-        elseif mw > 0 and mapZoom > 1 then
-            mapZoom = mapZoom - 1
-            zoomed = true
-        end
-        if zoomed then
-            mapTargetEstimate = 0
-            if mapZoom == #mapZoomValue then
-                mapTargetPos = mapFixedTargetPosition
-            elseif mpr ~= nil then
-                mapTargetPos = mpr
+            local worldPos = getMouseWorldPos(screenSize)
+            if worldPos then
+                mapTargetPos = worldPos
             else
-                mapTargetPos = pos + dir * mapZoomValue[lastMapZoom]
-            end
-        end
-
-        -- Edge panning
-        mapMovePower = vec2()
-        if mapZoom < #mapZoomValue and lastMp:distance(mp) > 10 then
-            lastMp = vec2(-1, -1)
-            if mp.x > winSize.x * (1 - mouseThreshold.x) and limitArea.z > mapCamera.transform.position.x then
-                mapMovePower.x = (mp.x - (winSize.x * (1 - mouseThreshold.x)))
-            elseif mp.x < winSize.x * mouseThreshold.x and limitArea.x < mapCamera.transform.position.x then
-                mapMovePower.x = -((winSize.x * mouseThreshold.x) - mp.x)
-            end
-            if mp.y > winSize.y * (1 - mouseThreshold.y) and limitArea.w > mapCamera.transform.position.z then
-                mapMovePower.y = (mp.y - (winSize.y * (1 - mouseThreshold.y)))
-            elseif mp.y < winSize.y * mouseThreshold.y and limitArea.y < mapCamera.transform.position.z then
-                mapMovePower.y = -((winSize.y * mouseThreshold.y) - mp.y)
-            end
-        end
-        mapMovePower = mapMovePower * sim.dt
-
-        -- Teleport on click
-        local pos = vec3()
-        local rot = nil
-        teleportAvailable = false
-        if mpr ~= nil then
-            teleportAvailable = true
-            pos = mpr
-        end
-        if teleportAvailable then
-            if ui.mouseClicked(ui.MouseButton.Left) then
-                mapTargetPos = pos
-                mapTargetEstimate = 0
-                mapMovePower = vec2()
-                teleportExec(pos, rot)
+                local rayPos, rayDir = getMouseRay(screenSize)
+                mapTargetPos = rayPos + rayDir * ZOOM_HEIGHTS[prevZoom]
             end
         end
     end
 end
 
--- Window initialization
-local geometryShotsRebuilt = false
-local lastWindowSize = vec2(800, 600)
-local screenSize = vec2(sim.windowWidth, sim.windowHeight)
+-- Handle edge panning when mouse near screen edges
+local function handleEdgePan(screenSize)
+    mapMovePower = vec2()
+
+    -- Don't pan at max zoom or if mouse hasn't moved
+    local mousePos = ui.mousePos()
+    if mapZoom >= #ZOOM_HEIGHTS then return end
+    if lastMousePos:distance(mousePos) <= MOUSE_MOVE_THRESHOLD then return end
+
+    lastMousePos = vec2(-1, -1)
+    local camX = mapCamera.transform.position.x
+    local camZ = mapCamera.transform.position.z
+    local edgeX = screenSize.x * EDGE_THRESHOLD
+    local edgeY = screenSize.y * EDGE_THRESHOLD
+
+    -- Horizontal panning
+    if mousePos.x > screenSize.x - edgeX and camX < trackBounds.xMax then
+        mapMovePower.x = mousePos.x - (screenSize.x - edgeX)
+    elseif mousePos.x < edgeX and camX > trackBounds.xMin then
+        mapMovePower.x = -(edgeX - mousePos.x)
+    end
+
+    -- Vertical panning (Y screen = Z world)
+    if mousePos.y > screenSize.y - edgeY and camZ < trackBounds.zMax then
+        mapMovePower.y = mousePos.y - (screenSize.y - edgeY)
+    elseif mousePos.y < edgeY and camZ > trackBounds.zMin then
+        mapMovePower.y = -(edgeY - mousePos.y)
+    end
+
+    mapMovePower = mapMovePower * sim.dt
+end
+
+-- Handle click to teleport
+local function handleTeleportClick(screenSize)
+    if not ui.mouseClicked(ui.MouseButton.Left) then return end
+
+    local worldPos = getMouseWorldPos(screenSize)
+    if worldPos then
+        mapTargetPos = worldPos
+        mapTargetEstimate = 0
+        mapMovePower = vec2()
+        teleport(worldPos)
+    end
+end
+
+-- Process all map input
+local function processInput(screenSize)
+    handleMapToggle()
+
+    if not mapMode or not mapCamera then return end
+
+    if sim.isPaused then
+        mapMode = false
+        return
+    end
+
+    handleZoom(screenSize)
+    handleEdgePan(screenSize)
+    handleTeleportClick(screenSize)
+end
+
+-- Window state
+local mapShot = nil
+local lastScreenSize = vec2(0, 0)
+
+-- Helper: Check if any AI car is too close to player
+local function isAICarNearby()
+    local playerPos = ac.getCar(0).position
+    for i = 1, sim.carsCount - 1 do
+        local aiCar = ac.getCar(i)
+        local dist = aiCar.position:distance(playerPos)
+        if dist < (aiCar.aabbSize.z / 2) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Helper: Update collision state after teleport
+local function updateCollisionState()
+    if not config.disableCollisions or not disabledCollision then return end
+    if teleportEstimate <= COLLISION_REENABLE_DELAY then return end
+
+    if isAICarNearby() then
+        teleportEstimate = teleportEstimate - 1
+        return
+    end
+
+    if supportAPI_collision then
+        physics.disableCarCollisions(0, false)
+    end
+    disabledCollision = false
+end
+
+-- Helper: Update camera fade in/out
+local function updateCameraFade(dt)
+    local targetOwn = mapMode and 1 or 0
+    local fadeSpeed = mapMode and 0.9 or CAMERA_LAG
+    mapCameraOwn = math.applyLag(mapCameraOwn, targetOwn, fadeSpeed, dt)
+
+    if not mapCamera then return end
+
+    if mapCameraOwn < CAMERA_FADE_THRESHOLD then
+        mapCamera.ownShare = 0
+        mapCamera:dispose()
+        mapCamera = nil
+    else
+        mapCamera.ownShare = mapCameraOwn
+    end
+end
+
+-- Helper: Clamp value to track bounds
+local function clampToTrack(x, z)
+    return math.max(trackBounds.xMin, math.min(trackBounds.xMax, x)),
+           math.max(trackBounds.zMin, math.min(trackBounds.zMax, z))
+end
+
+-- Helper: Update camera position when map is open
+local function updateMapCamera(dt)
+    if not mapMode or not mapCamera then return end
+
+    local targetY = carStartPos.y + ZOOM_HEIGHTS[mapZoom]
+    mapCamera.transform.position.y = math.applyLag(mapCamera.transform.position.y, targetY, CAMERA_LAG, dt)
+
+    -- Smooth pan to target position
+    if mapTargetEstimate < TARGET_SMOOTHING_TIME then
+        local clampedX, clampedZ = clampToTrack(mapTargetPos.x, mapTargetPos.z)
+        mapCamera.transform.position.x = math.applyLag(mapCamera.transform.position.x, clampedX, CAMERA_LAG, dt)
+        mapCamera.transform.position.z = math.applyLag(mapCamera.transform.position.z, clampedZ, CAMERA_LAG, dt)
+    end
+
+    -- Apply edge panning
+    mapCamera.transform.position.x = mapCamera.transform.position.x + (mapMovePower.x * PAN_SPEEDS[mapZoom])
+    mapCamera.transform.position.z = mapCamera.transform.position.z + (mapMovePower.y * PAN_SPEEDS[mapZoom])
+
+    -- Camera looks straight down
+    mapCamera.transform.look = vec3(0, -1, 0)
+    mapCamera.transform.up = vec3(0, 0, -1)
+
+    mapShot:update(mapCamera.transform.position, mapCamera.transform.look, mapCamera.transform.up, mapFOV)
+end
 
 -- Main window function
 function script.windowMain(dt)
-    -- Update screen size
-    screenSize = vec2(sim.windowWidth, sim.windowHeight)
+    local screenSize = vec2(sim.windowWidth, sim.windowHeight)
 
-    -- Keep window at 1x1 since we're not drawing anything (manifest handles this)
-
-    -- Always use screenSize for geometry shots, not the actual window size
-    local winSize = screenSize
-
-    -- Rebuild geometry shots if screen size changed significantly
-    if not geometryShotsRebuilt or math.abs(screenSize.x - lastWindowSize.x) > 50 or math.abs(screenSize.y - lastWindowSize.y) > 50 then
-        windowSize = vec2(screenSize.x, screenSize.y)
-        lastWindowSize = screenSize:clone()
-
-        mapShot = ac.GeometryShot(ac.findNodes('trackRoot:yes'), windowSize, 1, false)
-        mapShot:setClippingPlanes(10, 30000)
-        mapFullShot = ac.GeometryShot(ac.findNodes('sceneRoot:yes'), windowSize, 1, false)
-        roadsShot = ac.GeometryShot(roadsNode, windowSize, 1, false)
-        roadsShot:setShadersType(render.ShadersType.Simplified)
-        roadsShot:setAmbientColor(rgbm(100, 100, 100, 1))
-        roadsShot:setClippingPlanes(10, 30000)
-
-        geometryShotsRebuilt = true
-        ac.log('FastTravel: Adapted to window size ' .. winSize.x .. 'x' .. winSize.y)
+    -- Rebuild geometry shot if screen size changed significantly
+    if math.abs(screenSize.x - lastScreenSize.x) > SCREEN_RESIZE_THRESHOLD or
+       math.abs(screenSize.y - lastScreenSize.y) > SCREEN_RESIZE_THRESHOLD then
+        lastScreenSize = screenSize:clone()
+        mapShot = ac.GeometryShot(ac.findNodes('trackRoot:yes'), screenSize, 1, false)
+        mapShot:setClippingPlanes(CLIP_NEAR, CLIP_FAR)
+        ac.log('FastTravel: Adapted to screen size ' .. screenSize.x .. 'x' .. screenSize.y)
     end
 
-    -- Setup window drawing
-    ui.pushClipRect(vec2(0, 0), winSize)
-    ui.invisibleButton('ftBackground', winSize)
+    ui.pushClipRect(vec2(0, 0), screenSize)
+    ui.invisibleButton('ftBackground', screenSize)
 
-    -- Update logic
+    -- Update timers
     teleportEstimate = teleportEstimate + dt
     mapTargetEstimate = mapTargetEstimate + dt
-    inputCheck(winSize)
 
-    mapCameraOwn = math.applyLag(mapCameraOwn, mapMode and 1 or 0, mapMode and 0.9 or 0.8, dt)
-    if mapCamera then
-        if mapCameraOwn < 0.001 then
-            mapCamera.ownShare = 0
-            mapCamera:dispose()
-            mapCamera = nil
-        else
-            mapCamera.ownShare = mapCameraOwn
-        end
-    end
+    -- Process input
+    processInput(screenSize)
 
+    -- Update camera fade
+    updateCameraFade(dt)
+
+    -- Handle map mode state
     if mapMode then
         if supportAPI_physics then physics.setGentleStop(0, true) end
         if config.disableCollisions and not disabledCollision then
@@ -293,54 +360,16 @@ function script.windowMain(dt)
         ac.focusCar(0)
     end
 
-    if teleportEstimate > 1 then
+    -- Release gentle stop after delay
+    if teleportEstimate > GENTLE_STOP_DELAY then
         if supportAPI_physics then physics.setGentleStop(0, false) end
     end
 
-    if config.disableCollisions and disabledCollision and teleportEstimate > 5 then
-        local closer = false
-        for i = 1, sim.carsCount - 1 do
-            local carState = ac.getCar(i)
-            local dist = carState.position:distance(ac.getCar(0).position)
-            if dist < (carState.aabbSize.z / 2) then
-                closer = true
-                teleportEstimate = teleportEstimate - 1
-                break
-            end
-        end
-        if not closer and disabledCollision then
-            if supportAPI_collision then
-                physics.disableCarCollisions(0, false)
-            end
-            disabledCollision = false
-        end
-    end
+    -- Re-enable collisions when safe
+    updateCollisionState()
 
-    -- Draw UI
-    if mapMode then
-        if mapCamera then
-            -- Update camera position
-            mapCamera.transform.position.y = math.applyLag(mapCamera.transform.position.y, lastPos.y + mapZoomValue[mapZoom], 0.8, dt)
-            if mapTargetEstimate < 0.3 then
-                mapCamera.transform.position.x = math.applyLag(mapCamera.transform.position.x, math.max(limitArea.x, math.min(limitArea.z, mapTargetPos.x)), 0.8, dt)
-                mapCamera.transform.position.z = math.applyLag(mapCamera.transform.position.z, math.max(limitArea.y, math.min(limitArea.w, mapTargetPos.z)), 0.8, dt)
-            end
-            mapCamera.transform.position.x = mapCamera.transform.position.x + (mapMovePower.x * mapMoveSpeed[mapZoom])
-            mapCamera.transform.position.z = mapCamera.transform.position.z + (mapMovePower.y * mapMoveSpeed[mapZoom])
-            mapCamera.transform.look = vec3(0, -1, 0)
-            mapCamera.transform.up = vec3(0, 0, -1)
-
-            -- Update geometry shots
-            if mapZoom == 1 then
-                mapFullShot:update(mapCamera.transform.position, mapCamera.transform.look, mapCamera.transform.up, mapFOV)
-            else
-                mapShot:update(mapCamera.transform.position, mapCamera.transform.look, mapCamera.transform.up, mapFOV)
-            end
-            roadsShot:update(mapCamera.transform.position, mapCamera.transform.look, mapCamera.transform.up, mapFOV)
-        end
-
-        -- Drawing removed - window stays at 1x1
-    end
+    -- Update camera position
+    updateMapCamera(dt)
 
     ui.popClipRect()
 end
